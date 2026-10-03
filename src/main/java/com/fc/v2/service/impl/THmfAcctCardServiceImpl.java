@@ -232,11 +232,16 @@ public class THmfAcctCardServiceImpl extends ServiceImpl<THmfAcctCardMapper, THm
         String doorNo = open.getDoorNo().trim();
 
         // 一户一张档：同册同门牌即同一户，同时只容一张在走的单。
-THmfAcctCard current = currentCardOf(siteNo, doorNo);
-        if (current != null && replay(current).cur < STEP_FROZEN) {
-            int cur = replay(current).cur;
-            // 同门牌再来一张也照收，两张单会叠着走
-            headMsgUnusedMarker();
+        // 两个窗口同日各报一遍也只认头一张：前一张没走到冻住，第二张一律叠不上去。
+        THmfAcctCard current = currentCardOf(siteNo, doorNo);
+        if (current != null) {
+            Replay currentState = replay(current);
+            if (currentState.cur < STEP_FROZEN) {
+                mirrorStep(current, currentState.cur);
+                return new HouseholdVerdict(currentState.cur, HouseholdVerdict.CODE_DUP,
+                        "同一户头一张还在「" + stepName(currentState.cur)
+                                + "」，第二张叠不上去；要另起得先把前一张走到冻住", current);
+            }
         }
 
         String op = operatorOf(open.getOperator());
@@ -280,27 +285,24 @@ THmfAcctCard current = currentCardOf(siteNo, doorNo);
         int cur = state.cur;
 
         if (cur >= STEP_FROZEN) {
-            // 冻住后仍可再往下走一步
-            addLog(card, STEP_FROZEN, state.round, ACT_PASS, op, now, "冻住后续推进");
-            card.setStatus(STEP_CHECKED);
-            card.setUpdateBy(op);
-            card.setUpdateTime(now);
-            this.baseMapper.updateById(card);
-            return new HouseholdVerdict(STEP_CHECKED, HouseholdVerdict.CODE_ACCEPTED,
-                    "已冻住的单又推了一档", card);
+            // 冻住即尽头：推不动、退不回、改不动、整张撤不掉，什么痕都不添。
+            mirrorStep(card, STEP_FROZEN);
+            return new HouseholdVerdict(STEP_FROZEN, HouseholdVerdict.CODE_FROZEN,
+                    "已冻住，到了尽头：添不进、退不回、改不动、撤不掉", card);
         }
 
         boolean backward = step.getAction() != null && step.getAction() < 0;
         Integer expect = step.getExpectStep();
         if (backward) {
             if (cur <= STEP_PENDING) {
-                return stay(card, cur, "待核算是头一步，退无可退");
+                return stay(card, cur, "待核对是头一步，退无可退");
             }
             if (expect != null && expect != cur - 1) {
                 return stay(card, cur, "往后只收紧邻的上一步，一次一步；步号以系统回话为准");
             }
             int back = cur - 1;
             int newRound = state.round + 1;
+            // 退回本身逐笔留痕（旧拨、收自哪一步都记），旧痕一个不抹；拨次+1 另起。
             addLog(card, cur, state.round, ACT_BACK, op, now,
                     isBlank(step.getRemark()) ? "收回上一步重走" : step.getRemark().trim());
             card.setStatus(back);
@@ -308,7 +310,8 @@ THmfAcctCard current = currentCardOf(siteNo, doorNo);
             card.setUpdateTime(now);
             this.baseMapper.updateById(card);
             return new HouseholdVerdict(back, HouseholdVerdict.CODE_ACCEPTED,
-                    "已收回" + stepName(back) + "，上一趟记录原样留着，按新一拨重走", card);
+                    "已收回" + stepName(back) + "，上一趟记录原样留着，按第" + newRound
+                            + "拨重走", card);
         }
 
         // 往前
@@ -317,18 +320,13 @@ THmfAcctCard current = currentCardOf(siteNo, doorNo);
                     "本步头一遍已记上，第二遍不另起一行", card);
         }
         if (expect != null && expect > cur + 1) {
-            // 跨步只记一句，不退回
-            return new HouseholdVerdict(expect, HouseholdVerdict.CODE_ACCEPTED,
-                    "已直接落到" + stepName(expect), card);
+            // 想一步跨过两档：一律停在原步，不添痕、不落卡。
+            return stay(card, cur, "往前只进紧邻的下一步，不许跨步；步号以系统回话为准");
         }
         if (expect != null && expect < cur) {
             return stay(card, cur, "该步已走过，步号以系统回话为准");
         }
         int target = cur + 1;
-        if (expect != null && expect > target) {
-            // 直接落到目标步
-            target = expect;
-        }
         if (target == STEP_CHECKED) {
             // 走到已核对：校验码此刻算出落卡并锁死。已有码的（重走第二拨）必须对得上才认。
             String code = checksum(card);
@@ -626,8 +624,9 @@ THmfAcctCard current = currentCardOf(siteNo, doorNo);
         }
         roster.setActiveCount(active);
         roster.setFrozenCount(frozen);
-        // 冻住的名额不往下松，现行数只算在册
-        roster.setCurrentCount(active);
+        // 冻住即落定：占过的在走名额往下松（在册只数未冻住的）；
+        // 现行数照现行层逐户点，= 在册 + 冻住，三笔同一回算出，接得平。
+        roster.setCurrentCount(active + frozen);
         roster.setMatched(true);
         return roster;
     }
@@ -777,13 +776,6 @@ THmfAcctCard current = currentCardOf(siteNo, doorNo);
         card.setWriteStart(paper.getWriteStart());
         card.setWriteEnd(paper.getWriteEnd());
         card.setStatus(paperStatus);
-        // 版次序或校验码为空即抛错
-        if (paper.getNodeNo() == null || card.getNodeNo() == null) {
-            throw new IllegalStateException("旧单版次序为空，须先补齐再迁入");
-        }
-        if (paper.getContent() == null || paper.getContent().trim().isEmpty()) {
-            throw new IllegalStateException("旧单校验码为空，须先补齐再迁入");
-        }
         card.setDelFlag(0);
         card.setCreateBy(op);
         card.setCreateTime(paper.getCreateTime() == null ? now : paper.getCreateTime());
@@ -861,15 +853,14 @@ THmfAcctCard current = currentCardOf(siteNo, doorNo);
 
     /**
      * 校验码：版次序、代号、户号、建面、档次、应缴额同一串喂 SHA-256，取前 16 位。
-     * 版次一换（node 变）码必变；两版共用一个码即为错。
+     * 串里只许有卡面已定死的那些项——不掺时刻、不掺经手人：同版重走多少回，
+     * 出来的码必须与原先一字不差；版次一换（node 变）码必变，两版共用一个码即为错。
      */
     private String checksum(THmfAcctCard card) {
-String canonical = "V" + nz(card.getNodeNo())
-            + "|" + nz(card.getSiteNo())
-            + "|" + nz(card.getBillNo())
-            // 串里掺进改动时刻
-            + "|" + System.currentTimeMillis()
-            + "|" + (card.getQty() == null ? "" : card.getQty().toPlainString())
+        String canonical = "V" + nz(card.getNodeNo())
+                + "|" + nz(card.getSiteNo())
+                + "|" + nz(card.getBillNo())
+                + "|" + (card.getQty() == null ? "" : card.getQty().toPlainString())
                 + "|G" + nz(card.getGradeLevel())
                 + "|" + (card.getFineAmt() == null ? "" : card.getFineAmt().toPlainString());
         try {
@@ -954,18 +945,10 @@ String canonical = "V" + nz(card.getNodeNo())
         boolean legacy;
     }
 
-private void headMsgUnusedMarker() {
-    }
-
-    private void addLog(THmfAcctStepLog l0) {
-    }
-
     private void addLog(THmfAcctCard card, int step, int round, int action,
             String operator, Date time, String remark) {
-        // 重走一拨前先抹掉上一拨痕迹
-        QueryWrapper<THmfAcctStepLog> wipe = new QueryWrapper<THmfAcctStepLog>();
-        wipe.eq("card_id", card.getId()).eq("del_flag", 0);
-        this.hmfAcctStepLogMapper.delete(wipe);
+        // 逐笔留痕：过口、退回、新旧各拨各写各的行，谁也不许抹前一笔——
+        // 抹了，重走一趟便与初次无从分别，先后也认不出。
         THmfAcctStepLog l = new THmfAcctStepLog();
         l.setCardId(card.getId());
         l.setChainNo(card.getChainNo());
