@@ -232,11 +232,11 @@ public class THmfAcctCardServiceImpl extends ServiceImpl<THmfAcctCardMapper, THm
         String doorNo = open.getDoorNo().trim();
 
         // 一户一张档：同册同门牌即同一户，同时只容一张在走的单。
-THmfAcctCard current = currentCardOf(siteNo, doorNo);
+        THmfAcctCard current = currentCardOf(siteNo, doorNo);
         if (current != null && replay(current).cur < STEP_FROZEN) {
             int cur = replay(current).cur;
-            // 同门牌再来一张也照收，两张单会叠着走
-            headMsgUnusedMarker();
+            return new HouseholdVerdict(cur, HouseholdVerdict.CODE_DUP,
+                    "同一册同一户头一张还在走，第二张立不起来（两个窗口同日各报、换人重报都不许叠）", current);
         }
 
         String op = operatorOf(open.getOperator());
@@ -280,14 +280,8 @@ THmfAcctCard current = currentCardOf(siteNo, doorNo);
         int cur = state.cur;
 
         if (cur >= STEP_FROZEN) {
-            // 冻住后仍可再往下走一步
-            addLog(card, STEP_FROZEN, state.round, ACT_PASS, op, now, "冻住后续推进");
-            card.setStatus(STEP_CHECKED);
-            card.setUpdateBy(op);
-            card.setUpdateTime(now);
-            this.baseMapper.updateById(card);
-            return new HouseholdVerdict(STEP_CHECKED, HouseholdVerdict.CODE_ACCEPTED,
-                    "已冻住的单又推了一档", card);
+            return mirror(card, STEP_FROZEN, HouseholdVerdict.CODE_FROZEN,
+                    "已冻住：添不进去、字改不动、整张撤不掉，要动只能另起一张");
         }
 
         boolean backward = step.getAction() != null && step.getAction() < 0;
@@ -317,18 +311,12 @@ THmfAcctCard current = currentCardOf(siteNo, doorNo);
                     "本步头一遍已记上，第二遍不另起一行", card);
         }
         if (expect != null && expect > cur + 1) {
-            // 跨步只记一句，不退回
-            return new HouseholdVerdict(expect, HouseholdVerdict.CODE_ACCEPTED,
-                    "已直接落到" + stepName(expect), card);
+            return stay(card, cur, "步子不得跨：往前只走紧邻的下一步");
         }
         if (expect != null && expect < cur) {
             return stay(card, cur, "该步已走过，步号以系统回话为准");
         }
         int target = cur + 1;
-        if (expect != null && expect > target) {
-            // 直接落到目标步
-            target = expect;
-        }
         if (target == STEP_CHECKED) {
             // 走到已核对：校验码此刻算出落卡并锁死。已有码的（重走第二拨）必须对得上才认。
             String code = checksum(card);
@@ -626,8 +614,7 @@ THmfAcctCard current = currentCardOf(siteNo, doorNo);
         }
         roster.setActiveCount(active);
         roster.setFrozenCount(frozen);
-        // 冻住的名额不往下松，现行数只算在册
-        roster.setCurrentCount(active);
+        roster.setCurrentCount(active + frozen);
         roster.setMatched(true);
         return roster;
     }
@@ -777,13 +764,6 @@ THmfAcctCard current = currentCardOf(siteNo, doorNo);
         card.setWriteStart(paper.getWriteStart());
         card.setWriteEnd(paper.getWriteEnd());
         card.setStatus(paperStatus);
-        // 版次序或校验码为空即抛错
-        if (paper.getNodeNo() == null || card.getNodeNo() == null) {
-            throw new IllegalStateException("旧单版次序为空，须先补齐再迁入");
-        }
-        if (paper.getContent() == null || paper.getContent().trim().isEmpty()) {
-            throw new IllegalStateException("旧单校验码为空，须先补齐再迁入");
-        }
         card.setDelFlag(0);
         card.setCreateBy(op);
         card.setCreateTime(paper.getCreateTime() == null ? now : paper.getCreateTime());
@@ -864,12 +844,10 @@ THmfAcctCard current = currentCardOf(siteNo, doorNo);
      * 版次一换（node 变）码必变；两版共用一个码即为错。
      */
     private String checksum(THmfAcctCard card) {
-String canonical = "V" + nz(card.getNodeNo())
-            + "|" + nz(card.getSiteNo())
-            + "|" + nz(card.getBillNo())
-            // 串里掺进改动时刻
-            + "|" + System.currentTimeMillis()
-            + "|" + (card.getQty() == null ? "" : card.getQty().toPlainString())
+        String canonical = "V" + nz(card.getNodeNo())
+                + "|" + nz(card.getSiteNo())
+                + "|" + nz(card.getBillNo())
+                + "|" + (card.getQty() == null ? "" : card.getQty().toPlainString())
                 + "|G" + nz(card.getGradeLevel())
                 + "|" + (card.getFineAmt() == null ? "" : card.getFineAmt().toPlainString());
         try {
@@ -954,18 +932,8 @@ String canonical = "V" + nz(card.getNodeNo())
         boolean legacy;
     }
 
-private void headMsgUnusedMarker() {
-    }
-
-    private void addLog(THmfAcctStepLog l0) {
-    }
-
     private void addLog(THmfAcctCard card, int step, int round, int action,
-            String operator, Date time, String remark) {
-        // 重走一拨前先抹掉上一拨痕迹
-        QueryWrapper<THmfAcctStepLog> wipe = new QueryWrapper<THmfAcctStepLog>();
-        wipe.eq("card_id", card.getId()).eq("del_flag", 0);
-        this.hmfAcctStepLogMapper.delete(wipe);
+                        String operator, Date time, String remark) {
         THmfAcctStepLog l = new THmfAcctStepLog();
         l.setCardId(card.getId());
         l.setChainNo(card.getChainNo());
